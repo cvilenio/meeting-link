@@ -2,18 +2,24 @@
 //
 // Everything this page needs arrives in the URL fragment, which browsers never
 // send to the server hosting the page:
-//   #a=join|skip&id=<ack id>&t=<ack topic>[&u=<meeting url>]
+//   #a=join|skip|rsvp&id=<ack id>&t=<ack topic>[&u=<url>]
+//
+//   join  record, then open the meeting link (record only if there is no link)
+//   skip  record only
+//   rsvp  record, then open the event in Google Calendar to respond
 //
 // Safety rules:
 //   - only POSTs to https://ntfy.sh, and only `<action>:<id>`
-//   - only redirects to known meeting hosts over https (or zoommtg: for Zoom)
+//   - only redirects over https to known meeting hosts (join) or Google
+//     Calendar (rsvp), or to zoommtg: for Zoom on desktop
 //   - never writes fragment values into HTML
 
 "use strict";
 
 const NTFY = "https://ntfy.sh";
-const ACTIONS = { join: "Joined", skip: "Skipped" };
+const ACTIONS = ["join", "skip", "rsvp"];
 const MEETING_HOSTS = [/(^|\.)zoom\.us$/, /^meet\.google\.com$/, /^teams\.microsoft\.com$/, /^teams\.live\.com$/];
+const CALENDAR_HOSTS = [/^calendar\.google\.com$/, /^www\.google\.com$/];
 const TOKEN_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const POST_TIMEOUT_MS = 4000;
 
@@ -26,15 +32,16 @@ function show(status, detail = "") {
   detailEl.textContent = detail;
 }
 
-function meetingUrl(raw) {
-  if (!raw) return null;
+function safeUrl(raw, hosts) {
   let url;
   try {
     url = new URL(raw);
   } catch {
     return null;
   }
-  if (url.protocol !== "https:" || !MEETING_HOSTS.some((re) => re.test(url.hostname))) return null;
+  if (url.protocol !== "https:" || !hosts.some((re) => re.test(url.hostname))) return null;
+  // www.google.com is allowed only for Calendar event pages.
+  if (url.hostname === "www.google.com" && !url.pathname.startsWith("/calendar/")) return null;
   return url;
 }
 
@@ -74,30 +81,37 @@ async function main() {
   const action = params.get("a");
   const id = params.get("id");
   const topic = params.get("t");
-  if (!(action in ACTIONS) || !TOKEN_RE.test(id || "") || !TOKEN_RE.test(topic || "")) {
+  const rawUrl = params.get("u");
+  if (!ACTIONS.includes(action) || !TOKEN_RE.test(id || "") || !TOKEN_RE.test(topic || "")) {
     show("Nothing to do here.");
     return;
   }
 
-  const target = action === "join" ? meetingUrl(params.get("u")) : null;
-  if (action === "join" && !target) {
-    show("Invalid meeting link.", "Nothing was recorded. Open the meeting from your calendar.");
+  let target = null;
+  if (action === "join" && rawUrl) target = safeUrl(rawUrl, MEETING_HOSTS);
+  if (action === "rsvp") target = safeUrl(rawUrl || "", CALENDAR_HOSTS);
+  if (((action === "join" && rawUrl) || action === "rsvp") && !target) {
+    show("Invalid link.", "Nothing was recorded. Open the meeting from your calendar.");
     return;
   }
 
   const recorded = await record(topic, action, id);
+  const failed = "Could not reach ntfy, so escalation continues.";
 
-  if (action === "skip") {
-    show(recorded ? "Skipped" : "Not recorded", recorded ? "You can close this tab." : "Could not reach ntfy. Escalation continues.");
+  if (!target) {
+    const done = action === "join" ? "Joined" : "Skipped";
+    show(recorded ? done : "Not recorded", recorded ? "You can close this tab." : failed);
     return;
   }
 
-  const href = launchUrl(target);
+  const href = action === "join" ? launchUrl(target) : target.href;
+  const opening = action === "join" ? "Opening the meeting..." : "Opening Google Calendar...";
   if (recorded) {
-    show("Joined", "Opening the meeting...");
+    show(action === "join" ? "Joined" : "Respond in Calendar", opening);
   } else {
-    show("Not recorded", "Could not reach ntfy, so escalation continues. Opening the meeting anyway.");
+    show("Not recorded", `${failed} ${opening}`);
   }
+  continueEl.textContent = action === "join" ? "Open the meeting" : "Open Google Calendar";
   continueEl.href = href;
   continueEl.hidden = false;
   location.replace(href);
